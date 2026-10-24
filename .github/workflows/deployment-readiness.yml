@@ -1,0 +1,65 @@
+name: Deployment readiness
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'docker-entrypoint.sh'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'server/**'
+      - 'client/**'
+      - 'shared/**'
+      - '.github/workflows/deployment-readiness.yml'
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  docker-build:
+    name: Build production image and smoke-test it
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build --tag freellmapi-readiness:ci .
+
+      - name: Verify image metadata
+        run: |
+          docker image inspect freellmapi-readiness:ci --format 'Entrypoint={{json .Config.Entrypoint}} Cmd={{json .Config.Cmd}} ExposedPorts={{json .Config.ExposedPorts}}'
+          test "$(docker image inspect freellmapi-readiness:ci --format '{{.Config.User}}')" = "root"
+
+      - name: Start container with persistent volume and test health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEY="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")"
+          docker volume create freellmapi-ci-data >/dev/null
+          docker run -d --name freellmapi-ci             -e NODE_ENV=production             -e PORT=3001             -e ENCRYPTION_KEY="$KEY"             -p 127.0.0.1:3001:3001             -v freellmapi-ci-data:/app/server/data             freellmapi-readiness:ci
+          cleanup() {
+            docker logs freellmapi-ci || true
+            docker rm -f freellmapi-ci >/dev/null 2>&1 || true
+            docker volume rm freellmapi-ci-data >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          for attempt in $(seq 1 45); do
+            if curl --fail --silent --show-error http://127.0.0.1:3001/api/ping; then
+              echo
+              echo "Health endpoint returned success."
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' freellmapi-ci 2>/dev/null || echo false)" != "true" ]; then
+              echo "Container exited before becoming healthy."
+              docker logs freellmapi-ci || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Health endpoint did not become healthy in time."
+          exit 1
